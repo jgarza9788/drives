@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -49,8 +50,18 @@ def under(path, mount):
     return path == mount or path.startswith(mount.rstrip("/") + "/")
 
 
+def start_time(pid):
+    """Boot-relative start time of pid (stat field 22), or None if gone."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            # comm (field 2) may contain spaces or ')'; fields resume after the last ')'.
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def busy_procs(mount):
-    """[{pid, name}] for processes of ours with anything open under mount."""
+    """[{pid, name, start}] for processes of ours with anything open under mount."""
     me = os.getpid()
     procs = []
     for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -83,24 +94,52 @@ def busy_procs(mount):
                     name = f.read().strip()
             except OSError:
                 name = "?"
-            procs.append({"pid": int(pid), "name": name})
+            procs.append({"pid": int(pid), "name": name, "start": start_time(int(pid))})
     return procs
 
 
 def terminate(procs):
+    """SIGTERM procs, then SIGKILL whatever is left after 2s.
+
+    Signals go through pidfds so a PID that exits and gets reused meanwhile
+    is never hit. A pidfd pins whatever holds the PID when it's opened, so
+    the start time is re-checked after opening to confirm it's still the
+    process busy_procs saw.
+    """
+    fds = []
     for p in procs:
         try:
-            os.kill(p["pid"], signal.SIGTERM)
+            fd = os.pidfd_open(p["pid"])
         except OSError:
-            pass
-    deadline = time.time() + 2
-    while time.time() < deadline and any(os.path.exists("/proc/%d" % p["pid"]) for p in procs):
-        time.sleep(0.1)
-    for p in procs:
-        try:
-            os.kill(p["pid"], signal.SIGKILL)
-        except OSError:
-            pass
+            continue  # already gone
+        if p["start"] is None or start_time(p["pid"]) != p["start"]:
+            os.close(fd)  # exited and PID reused since the scan
+            continue
+        fds.append(fd)
+    try:
+        for fd in fds:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGTERM)
+            except OSError:
+                pass
+        # A pidfd polls readable once its process exits.
+        poller = select.poll()
+        for fd in fds:
+            poller.register(fd, select.POLLIN)
+        live = set(fds)
+        deadline = time.monotonic() + 2
+        while live and (left := deadline - time.monotonic()) > 0:
+            for fd, _ in poller.poll(left * 1000):
+                live.discard(fd)
+                poller.unregister(fd)
+        for fd in live:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except OSError:
+                pass
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 def proc_list(procs):

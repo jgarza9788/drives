@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Stream disk write activity for the jgarza.drives bar widget.
+
+Runs forever, printing a JSON line whenever something changes:
+
+  {"disks": {"sda": {...}, "sda1": {"writing": true, "rate": 12582912}}, "cached": 104857600}
+
+Keys are lsblk NAMEs: whole disks, their partitions, and device-mapper
+nodes under their mapper name (so an unlocked LUKS volume is keyed the way
+lsblk names it), letting the card pin activity to one filesystem.
+
+writing  the disk wrote sectors (or has writes in flight) in the last ~1.5s
+rate     bytes/s written over the last second
+cached   Dirty + Writeback from /proc/meminfo — data applications have
+         "written" that the kernel hasn't flushed to any disk yet. It is
+         system-wide (the kernel doesn't expose it per device without root),
+         so the card only shows it as a hint; eject flushes it regardless.
+"""
+
+import json
+import os
+import sys
+import time
+
+INTERVAL = 1.0
+STICKY = 1.5  # keep "writing" on across short gaps so the icon doesn't flicker
+
+
+def devices():
+    """lsblk NAME -> sysfs dir, for disks, partitions and dm mappers."""
+    out = {}
+    for d in os.listdir("/sys/block"):
+        if d.startswith(("loop", "zram", "ram")):
+            continue
+        base = "/sys/block/" + d
+        name = d
+        if d.startswith("dm-"):
+            try:
+                with open(base + "/dm/name") as f:
+                    name = f.read().strip() or d
+            except OSError:
+                pass
+        out[name] = base
+        for part in os.listdir(base):
+            if part.startswith(d) and os.path.isfile(os.path.join(base, part, "stat")):
+                out[part] = os.path.join(base, part)
+    return out
+
+
+def write_state(sysdir):
+    """(sectors written, writes in flight) for one block device."""
+    try:
+        with open(sysdir + "/stat") as f:
+            fields = f.read().split()
+        return int(fields[6]), int(fields[8]) if len(fields) > 8 else 0
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def cached_bytes():
+    total = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(("Dirty:", "Writeback:")):
+                    total += int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return total
+
+
+def main():
+    last = {}
+    last_write = {}
+    last_out = None
+    while True:
+        now = time.time()
+        state = {}
+        for d, sysdir in devices().items():
+            ws = write_state(sysdir)
+            if ws is None:
+                continue
+            sectors, inflight = ws
+            prev = last.get(d)
+            rate = (sectors - prev) * 512 / INTERVAL if prev is not None and sectors >= prev else 0
+            last[d] = sectors
+            if rate > 0 or inflight > 0:
+                last_write[d] = now
+            writing = now - last_write.get(d, 0) < STICKY
+            if writing:
+                state[d] = {"writing": True, "rate": int(rate)}
+        # Round the cache to whole MB so idle noise doesn't spam updates.
+        out = {"disks": state, "cached": cached_bytes() // (1024 * 1024) * 1024 * 1024}
+        text = json.dumps(out, sort_keys=True)
+        if text != last_out:
+            print(text, flush=True)
+            last_out = text
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)

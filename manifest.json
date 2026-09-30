@@ -1,0 +1,183 @@
+{
+  "schemaVersion": 1,
+  "id": "jgarza.drives",
+  "name": "Drives",
+  "version": "1.0.0",
+  "author": "jgarza",
+  "description": "One bar icon per drive — thumb drives, external and internal disks, SD cards, discs, images, network shares and cloud drives. Hover for usage, activity and specs; mount, open, eject.",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Drives",
+    "description": "An icon for each mounted drive",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalSec": 10,
+      "alwaysShow": false,
+      "showNetwork": true,
+      "thumbMaxGb": 256,
+      "showUnmounted": true,
+      "minUnmountedMb": 64,
+      "fullWarnPct": 90,
+      "groupAt": 4,
+      "iconThumb": "󱊞",
+      "iconExternal": "󰋊",
+      "iconInternal": "",
+      "iconSd": "󰟜",
+      "iconOptical": "󰗮",
+      "iconImage": "󰨣",
+      "iconNetwork": "󰒍",
+      "iconGdrive": "󰊶",
+      "iconOnedrive": "󰏊",
+      "iconDropbox": "󰇣",
+      "iconCloud": "󰅟"
+    },
+    "schema": [
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "Fallback poll; plugging a drive in refreshes right away.",
+        "min": 2,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Always show",
+        "description": "Show a dim disk icon when nothing is mounted.",
+        "defaultValue": false
+      },
+      {
+        "key": "showNetwork",
+        "type": "boolean",
+        "label": "Show network & cloud drives",
+        "description": "NFS/SMB/sshfs shares, rclone mounts (Google Drive, OneDrive, Dropbox…) and GNOME Online Accounts drives.",
+        "defaultValue": true
+      },
+      {
+        "key": "thumbMaxGb",
+        "type": "integer",
+        "label": "Thumb drive size limit (GB)",
+        "description": "USB disks this size or smaller count as thumb drives unless the model name says otherwise.",
+        "min": 8,
+        "max": 4096,
+        "step": 8,
+        "defaultValue": 256
+      },
+      {
+        "key": "showUnmounted",
+        "type": "boolean",
+        "label": "Show unmounted drives",
+        "description": "Plugged-in drives that aren't mounted yet appear dimmed, with a Mount (or Unlock) button.",
+        "defaultValue": true
+      },
+      {
+        "key": "minUnmountedMb",
+        "type": "integer",
+        "label": "Hide unmounted partitions under (MB)",
+        "description": "Skips tiny EFI/boot helper partitions.",
+        "min": 0,
+        "max": 4096,
+        "step": 16,
+        "defaultValue": 64
+      },
+      {
+        "key": "fullWarnPct",
+        "type": "integer",
+        "label": "Nearly full at (%)",
+        "description": "The bar icon and usage bar turn the urgent colour at this fill level.",
+        "min": 50,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 90
+      },
+      {
+        "key": "groupAt",
+        "type": "integer",
+        "label": "Group icons at",
+        "description": "With this many drives or more, show one icon with a count. 0 never groups.",
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 4
+      },
+      {
+        "key": "iconThumb",
+        "type": "string",
+        "label": "Thumb drive icon",
+        "defaultValue": "󱊞"
+      },
+      {
+        "key": "iconExternal",
+        "type": "string",
+        "label": "External drive icon",
+        "defaultValue": "󰋊"
+      },
+      {
+        "key": "iconInternal",
+        "type": "string",
+        "label": "Internal drive icon",
+        "defaultValue": ""
+      },
+      {
+        "key": "iconSd",
+        "type": "string",
+        "label": "SD card icon",
+        "defaultValue": "󰟜"
+      },
+      {
+        "key": "iconOptical",
+        "type": "string",
+        "label": "Disc icon",
+        "defaultValue": "󰗮"
+      },
+      {
+        "key": "iconImage",
+        "type": "string",
+        "label": "Disk image icon",
+        "defaultValue": "󰨣"
+      },
+      {
+        "key": "iconNetwork",
+        "type": "string",
+        "label": "Network share icon",
+        "defaultValue": "󰒍"
+      },
+      {
+        "key": "iconGdrive",
+        "type": "string",
+        "label": "Google Drive icon",
+        "defaultValue": "󰊶"
+      },
+      {
+        "key": "iconOnedrive",
+        "type": "string",
+        "label": "OneDrive icon",
+        "defaultValue": "󰏊"
+      },
+      {
+        "key": "iconDropbox",
+        "type": "string",
+        "label": "Dropbox icon",
+        "defaultValue": "󰇣"
+      },
+      {
+        "key": "iconCloud",
+        "type": "string",
+        "label": "Other cloud drive icon",
+        "defaultValue": "󰅟"
+      }
+    ]
+  },
+  "homepage": "https://github.com/jgarza9788/drives"
+}

@@ -5,6 +5,7 @@ Run: python3 -m unittest discover tests
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -53,6 +54,31 @@ class StartTimeTest(unittest.TestCase):
 
     def test_missing_process(self):
         self.assertIsNone(da.start_time(2 ** 22 + 1))  # above pid_max limit
+
+
+class AncestorsTest(unittest.TestCase):
+    def test_walks_up_from_parent(self):
+        up = da.ancestors()
+        self.assertIn(os.getppid(), up)
+        self.assertNotIn(os.getpid(), up)
+        self.assertNotIn(1, up)
+
+    def test_child_sees_its_whole_chain(self):
+        # A grandchild's ancestors include its parent and us.
+        script = ("import importlib.machinery as m, importlib.util as u, sys\n"
+                  "sys.dont_write_bytecode = True\n"
+                  "l = m.SourceFileLoader('da', %r); d = u.module_from_spec(u.spec_from_loader('da', l))\n"
+                  "l.exec_module(d); print(sorted(d.ancestors()))\n"
+                  % os.path.join(ROOT, "bin", "drives-action"))
+        out = subprocess.run(["sh", "-c", 'exec "$0" -c "$1"', sys.executable, script],
+                             capture_output=True, text=True, timeout=10).stdout
+        chain = set(json.loads(out))
+        self.assertIn(os.getpid(), chain)
+        self.assertTrue(da.ancestors() <= chain)
+
+    def test_stops_on_unreadable_stat(self):
+        with mock.patch("builtins.open", side_effect=OSError):
+            self.assertEqual(da.ancestors(), {os.getppid()})
 
 
 class TerminateTest(unittest.TestCase):
@@ -121,6 +147,24 @@ class TerminateTest(unittest.TestCase):
         self.assertEqual(ok.wait(timeout=2), -15)
         self.assertEqual(stubborn.wait(timeout=2), -9)
         self.assertIsNone(stale.poll())
+
+    def test_ancestors_are_never_signalled(self):
+        # Stand-in for the bar shell / Hyprland holding a file on the drive.
+        p = self.child("sleep", "60")
+        with mock.patch.object(da, "ancestors", return_value={p.pid}):
+            t = time.monotonic()
+            da.terminate([entry(p)])
+        self.assertLess(time.monotonic() - t, 0.5)  # nothing left to wait on
+        time.sleep(0.1)
+        self.assertIsNone(p.poll())
+
+    def test_ancestors_skipped_others_still_terminated(self):
+        shell = self.child("sleep", "60")
+        app = self.child("sleep", "60")
+        with mock.patch.object(da, "ancestors", return_value={shell.pid}):
+            da.terminate([entry(shell), entry(app)])
+        self.assertEqual(app.wait(timeout=2), -15)
+        self.assertIsNone(shell.poll())
 
     def test_busy_procs_records_start_time(self):
         d = os.path.join(os.environ.get("TMPDIR", "/tmp"), "drives-action-test-%d" % os.getpid())

@@ -103,10 +103,12 @@ BarWidget {
       }
     }
     root.drives = next
-    // Forget UI state for drives that went away.
+    // Forget UI state for drives that went away, and pending-upload
+    // warnings once the uploads have finished.
     var busy = {}, info = {}
     for (var n = 0; n < keys.length; n++) {
-      if (root.busy[keys[n]]) busy[keys[n]] = root.busy[keys[n]]
+      var b = root.busy[keys[n]]
+      if (b && !(b.uploads > 0 && !(next[n].pending > 0))) busy[keys[n]] = b
       if (root.infoOpen[keys[n]]) info[keys[n]] = true
     }
     root.busy = busy

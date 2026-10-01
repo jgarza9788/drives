@@ -119,9 +119,15 @@ def bounded_usage(mountpoints, timeout=NET_USAGE_TIMEOUT):
             size, used, ro = p.communicate(timeout=max(0, deadline - time.monotonic()))[0].split()
             out[m] = (int(size), int(used), ro == "1")
         except subprocess.TimeoutExpired:
-            # Don't wait for it: a child stuck in the kernel dies only once
-            # the server answers. It holds none of our fds, so we can exit.
+            # Reap it if SIGKILL works (FUSE waits are killable), but don't
+            # wait on hard NFS, which only lets go once the server answers.
+            # It holds none of our fds, so we can exit either way.
             p.kill()
+            p.stdout.close()
+            try:
+                p.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                pass
         except ValueError:
             pass  # statvfs failed in the child
     return out

@@ -14,6 +14,8 @@ Prints one JSON line: {"status": "ok"|"busy"|"error", "message", "procs",
 Before unmounting, eject looks for processes holding files under the
 mountpoint (cwd, open files, mapped libraries). If any, it refuses and
 reports them — unless --kill, which SIGTERMs them (SIGKILL after 2s) first.
+--kill never touches this helper's own ancestors (the bar shell, Hyprland,
+the session): those stay listed as busy instead.
 Only this user's processes are visible; root-held files still fail at
 unmount and show udisks' own error.
 """
@@ -60,6 +62,23 @@ def start_time(pid):
         return None
 
 
+def ancestors():
+    """PIDs above this process: the bar shell, Hyprland, systemd --user, ….
+
+    Killing one would take the desktop (and this helper) down with it.
+    """
+    pids = set()
+    pid = os.getppid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])  # field 4: ppid
+        except (OSError, IndexError, ValueError):
+            break
+    return pids
+
+
 def busy_procs(mount):
     """[{pid, name, start}] for processes of ours with anything open under mount."""
     me = os.getpid()
@@ -99,7 +118,7 @@ def busy_procs(mount):
 
 
 def terminate(procs):
-    """SIGTERM procs, then SIGKILL whatever is left after 2s.
+    """SIGTERM procs, then SIGKILL whatever is left after 2s. Ancestors are skipped.
 
     Signals go through pidfds so a PID that exits and gets reused meanwhile
     is never hit. A pidfd pins whatever holds the PID when it's opened, so
@@ -107,7 +126,10 @@ def terminate(procs):
     process busy_procs saw.
     """
     fds = []
+    protected = ancestors()
     for p in procs:
+        if p["pid"] in protected:
+            continue
         try:
             fd = os.pidfd_open(p["pid"])
         except OSError:

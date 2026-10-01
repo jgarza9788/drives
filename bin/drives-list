@@ -26,6 +26,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 import urllib.request
 
 NETWORK_FSTYPES = "nfs,nfs4,cifs,smb3,smbfs,fuse.sshfs,davfs,9p"
@@ -40,6 +42,18 @@ SD_MODEL = re.compile(r"\bsd\b|sd/mmc|mmc|card ?reader|microsd|sdxc|sdhc|multi-c
 IMAGE_ROOTS = ("/run/media/", "/media/", "/mnt/")
 # Filesystems worth offering a Mount button for.
 UNMOUNTED_SKIP = {"swap", "crypto_LUKS", "LVM2_member", "linux_raid_member", "zfs_member", "bcache"}
+
+# statvfs on a mount whose server went away can block forever (uninterruptibly,
+# for hard NFS), so network usage is read in child processes we can abandon.
+NET_USAGE_TIMEOUT = 2.0
+STATVFS_CHILD = (
+    "import os, sys\n"
+    "s = os.statvfs(sys.argv[1])\n"
+    "print(s.f_blocks * s.f_frsize, (s.f_blocks - s.f_bfree) * s.f_frsize,"
+    " int(bool(s.f_flag & os.ST_RDONLY)))")
+
+# rc's /vfs/stats reply is a few hundred bytes; refuse anything far larger.
+RCLONE_RC_MAX_BYTES = 64 * 1024
 
 # rclone backend type -> kind; gvfs mount prefix -> kind.
 RCLONE_KINDS = {"drive": "gdrive", "onedrive": "onedrive", "dropbox": "dropbox"}
@@ -81,6 +95,43 @@ def usage(mountpoint):
     size = st.f_blocks * st.f_frsize
     used = (st.f_blocks - st.f_bfree) * st.f_frsize
     return size, used, bool(st.f_flag & os.ST_RDONLY)
+
+
+def bounded_usage(mountpoints, timeout=NET_USAGE_TIMEOUT):
+    """mountpoint -> (size, used, readOnly), all queried in parallel; zeros
+    for any that can't be read or don't answer within timeout."""
+    procs = {}
+    for m in mountpoints:
+        try:
+            procs[m] = subprocess.Popen([sys.executable, "-c", STATVFS_CHILD, m],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            pass
+    deadline = time.monotonic() + timeout
+    out = {}
+    for m in mountpoints:
+        out[m] = (0, 0, False)
+        p = procs.get(m)
+        if p is None:
+            continue
+        try:
+            size, used, ro = p.communicate(timeout=max(0, deadline - time.monotonic()))[0].split()
+            out[m] = (int(size), int(used), ro == "1")
+        except subprocess.TimeoutExpired:
+            # Don't wait for it: a child stuck in the kernel dies only once
+            # the server answers. It holds none of our fds, so we can exit.
+            p.kill()
+        except ValueError:
+            pass  # statvfs failed in the child
+    return out
+
+
+def fill_usage(drives):
+    use = bounded_usage([d["mountpoint"] for d in drives])
+    for d in drives:
+        d["size"], d["used"], d["readOnly"] = use[d["mountpoint"]]
+        d["pct"] = pct(d["used"], d["size"])
 
 
 def pct(used, size):
@@ -207,12 +258,12 @@ def block_drives(thumb_max_bytes, unmounted, min_unmounted_bytes):
 
 
 def plain_entry(label, mountpoint, source, fstype, kind, eject):
-    size, used, ro = usage(mountpoint)
+    """A non-block mount. Usage is left at zero for fill_usage()."""
     return {
         "key": mountpoint, "name": source, "path": source, "disk": "", "diskName": "",
         "label": label, "mountpoint": mountpoint, "fstype": fstype, "fsver": "", "uuid": "",
         "kind": kind, "mounted": True, "locked": False, "encrypted": False, "luksPath": "",
-        "readOnly": ro, "size": size, "used": used, "pct": pct(used, size),
+        "readOnly": False, "size": 0, "used": 0, "pct": 0,
         "removable": False, "eject": eject, "vendor": "", "model": "", "serial": "",
         "transport": "network", "connection": "", "pending": -1,
     }
@@ -240,16 +291,19 @@ def network_drives():
     return drives
 
 
-def rclone_rc_addrs():
-    """remote name -> rc URL for every `rclone mount ... --rc` process."""
-    addrs = {}
-    for line in run(["pgrep", "-a", "rclone"]).splitlines():
-        args = line.split()[1:]
-        if "mount" not in args:
+def rclone_mounts():
+    """[(args after `mount`, rc URL)] for this user's `rclone mount --rc` processes."""
+    found = []
+    for pid in run(["pgrep", "-u", str(os.getuid()), "-x", "rclone"]).split():
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                args = f.read().decode(errors="replace").split("\0")[1:]
+        except OSError:
             continue
-        i = args.index("mount")
-        remote = args[i + 1].split(":", 1)[0] if len(args) > i + 1 else ""
-        if "--rc" not in args and not any(a.startswith("--rc-addr") for a in args):
+        verb = next((a for a in ("mount", "cmount") if a in args), None)
+        if verb is None:
+            continue
+        if not any(a == "--rc" or a.startswith(("--rc=", "--rc-addr")) for a in args):
             continue
         addr = "localhost:5572"
         for j, a in enumerate(args):
@@ -259,18 +313,38 @@ def rclone_rc_addrs():
                 addr = args[j + 1]
         if addr.startswith(":"):
             addr = "localhost" + addr
-        addrs[remote] = "http://" + addr
-    return addrs
+        found.append((args[args.index(verb) + 1:], "http://" + addr))
+    return found
 
 
-def rclone_pending(url, remote):
-    """Uploads queued + in progress for one mount, or -1 if rc won't say."""
+def rc_url_for(mounts, source):
+    """rc URL of the rclone process serving `source` ("gdrive:docs"), or None.
+
+    Flags can sit anywhere around the remote (`mount --vfs-cache-mode writes
+    gdrive: ~/g`), so look for it among the arguments rather than by position.
+    """
+    remote = source.split(":", 1)[0]
+    for exact in (True, False):
+        for args, url in mounts:
+            for a in args:
+                if a.startswith("-") or ":" not in a:
+                    continue
+                if a == source if exact else a.split(":", 1)[0] == remote:
+                    return url
+    return None
+
+
+def rclone_pending(url, fs):
+    """Uploads queued + in progress for the VFS of `fs` ("gdrive:docs"), or -1 if rc won't say."""
     try:
         req = urllib.request.Request(url + "/vfs/stats", method="POST",
-                                     data=json.dumps({"fs": remote + ":"}).encode(),
+                                     data=json.dumps({"fs": fs}).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=1) as resp:
-            cache = json.load(resp).get("diskCache") or {}
+            body = resp.read(RCLONE_RC_MAX_BYTES + 1)
+        if len(body) > RCLONE_RC_MAX_BYTES:
+            return -1
+        cache = json.loads(body).get("diskCache") or {}
         return int(cache.get("uploadsInProgress", 0)) + int(cache.get("uploadsQueued", 0))
     except Exception:
         return -1
@@ -286,7 +360,7 @@ def rclone_drives():
         parts = line.split()
         if len(parts) >= 2:
             types[parts[0].rstrip(":")] = parts[1]
-    rc = rclone_rc_addrs()
+    rc = rclone_mounts()
     drives = []
     for fs in mounts:
         source = fs.get("source") or ""
@@ -294,8 +368,9 @@ def rclone_drives():
         kind = RCLONE_KINDS.get(types.get(remote, ""), "cloud")
         d = plain_entry(remote or basename(fs["target"]), fs["target"], source, "rclone", kind, "fuse")
         d["connection"] = "rclone " + (types.get(remote) or "remote")
-        if remote in rc:
-            d["pending"] = rclone_pending(rc[remote], remote)
+        url = rc_url_for(rc, source)
+        if url:
+            d["pending"] = rclone_pending(url, source)
         drives.append(d)
     return drives
 
@@ -322,10 +397,9 @@ def gvfs_drives():
         if params.get("share"):
             label = params["share"] + " on " + params.get("server", params.get("host", ""))
         mountpoint = os.path.join(root, name)
-        # usage() on a cloud gvfs dir can block on the network; skip it.
-        d = plain_entry(label or scheme, "/nonexistent", name, "gvfs " + scheme, kind, "gio")
-        d.update({"key": mountpoint, "mountpoint": mountpoint, "readOnly": False,
-                  "connection": "GNOME " + scheme})
+        # Usage of a cloud gvfs dir can block on the network; leave it unknown.
+        d = plain_entry(label or scheme, mountpoint, name, "gvfs " + scheme, kind, "gio")
+        d["connection"] = "GNOME " + scheme
         drives.append(d)
     return drives
 
@@ -341,14 +415,22 @@ def main():
     parser.add_argument("--thumb-max-gb", type=float, default=256,
                         help="USB disks at or under this size count as thumb drives")
     args = parser.parse_args()
-    try:
-        drives = block_drives(int(args.thumb_max_gb * 1024 ** 3), args.unmounted,
-                              int(args.min_unmounted_mb * 1024 ** 2))
-        if args.network:
-            drives += network_drives() + rclone_drives() + gvfs_drives()
-        print(json.dumps({"drives": drives, "error": ""}))
-    except Exception as exc:  # the widget shows nothing rather than crashing
-        print(json.dumps({"drives": [], "error": str(exc)}))
+    # Each source fails alone: a broken lsblk must not hide network drives.
+    sources = [lambda: block_drives(int(args.thumb_max_gb * 1024 ** 3), args.unmounted,
+                                    int(args.min_unmounted_mb * 1024 ** 2))]
+    if args.network:
+        def mounted_network():
+            drives = network_drives() + rclone_drives()
+            fill_usage(drives)
+            return drives
+        sources += [mounted_network, gvfs_drives]
+    drives, errors = [], []
+    for source in sources:
+        try:
+            drives += source()
+        except Exception as exc:
+            errors.append(str(exc) or type(exc).__name__)
+    print(json.dumps({"drives": drives, "error": "; ".join(errors)}))
 
 
 if __name__ == "__main__":

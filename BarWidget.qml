@@ -20,8 +20,8 @@ BarWidget {
   // devices are listed. Kernel dirty+writeback bytes.
   property var activity: ({})
   property real cached: 0
-  // drive.key -> {message, procs}; drive.key -> true. Reassigned, not
-  // mutated, so bindings notice.
+  // drive.key -> {message, procs, uploads}; drive.key -> true. Reassigned,
+  // not mutated, so bindings notice.
   property var busy: ({})
   property var infoOpen: ({})
   property int openCards: 0
@@ -196,8 +196,16 @@ BarWidget {
          "--mount", d.mountpoint, "--name", displayName(d)], function(result) { setBusy(d, result) })
   }
 
-  function eject(d, kill) {
+  // `force` skips the pending-uploads check: unmounting rclone mid-upload
+  // leaves the files in its local cache until the remote is mounted again.
+  function eject(d, kill, force) {
     if (!d.mounted || !d.eject) return
+    if (d.pending > 0 && !force) {
+      var n = d.pending + " upload" + (d.pending === 1 ? "" : "s")
+      setBusy(d, { status: "busy", procs: [], uploads: d.pending,
+                   message: n + " still pending — unmounting now leaves them in rclone's cache until it's mounted again" })
+      return
+    }
     var cmd = [script("drives-action"), "eject", "--mode", d.eject, "--mount", d.mountpoint,
                "--name", displayName(d)]
     if (d.path && d.eject !== "fuse" && d.eject !== "gio") cmd.push("--dev", d.path)
@@ -210,7 +218,8 @@ BarWidget {
 
   function setBusy(d, result) {
     var next = Object.assign({}, root.busy)
-    if (result.status === "busy") next[d.key] = { message: result.message, procs: result.procs || [] }
+    if (result.status === "busy")
+      next[d.key] = { message: result.message, procs: result.procs || [], uploads: result.uploads || 0 }
     else delete next[d.key]
     root.busy = next
   }

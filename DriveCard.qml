@@ -10,6 +10,7 @@ import "Model.js" as Model
 //   [██████░░░░░░░░░░░░░░]
 //   󰏫 Writing… 23 MB/s — wait before unplugging
 //   Busy — in use by nvim (123)  [Retry] [Close apps & eject]
+//   Busy — 2 uploads still pending …  [Retry] [Unmount anyway]
 //   [Open] [Eject] [Info]
 //   ┌ Info: device, filesystem, UUID, model, serial, connection, … ┐
 //
@@ -147,7 +148,8 @@ Column {
     font.pixelSize: Style.font.caption
   }
 
-  // Busy: something still has files open on the drive.
+  // Busy: something still has files open on the drive, or rclone is
+  // still uploading.
   Column {
     visible: card.busy !== null
     width: parent.width
@@ -181,6 +183,15 @@ Column {
         bordered: true
         foreground: Color.urgent
         onClicked: card.widget.eject(card.drive, true)
+      }
+
+      Button {
+        visible: !!(card.busy && card.busy.uploads > 0)
+        iconText: "\u{f01ea}"
+        text: "Unmount anyway"
+        bordered: true
+        foreground: Color.urgent
+        onClicked: card.widget.eject(card.drive, false, true)
       }
     }
   }

@@ -31,20 +31,37 @@ _loader.exec_module(dl)
 class FakeRc(http.server.BaseHTTPRequestHandler):
     body = b""
     chunked = False  # stream with no Content-Length, like a hostile endpoint
+    # Seconds between single bytes of the body / between header lines: each
+    # gap is under urlopen's per-read timeout, so only an overall deadline helps.
+    trickle_body = 0
+    trickle_headers = 0
+    stop = threading.Event()
     requests = []
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         FakeRc.requests.append((self.path, json.loads(self.rfile.read(length))))
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        if not self.chunked:
-            self.send_header("Content-Length", str(len(self.body)))
-        self.end_headers()
         try:
-            self.wfile.write(self.body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            if not self.chunked:
+                self.send_header("Content-Length", str(len(self.body)))
+            for i in range(100 if self.trickle_headers else 0):
+                self.send_header("X-Pad-%d" % i, "x")
+                self.flush_headers()
+                if self.stop.wait(self.trickle_headers):
+                    return
+            self.end_headers()
+            if self.trickle_body:
+                for i in range(len(self.body)):
+                    self.wfile.write(self.body[i:i + 1])
+                    self.wfile.flush()
+                    if self.stop.wait(self.trickle_body):
+                        return
+            else:
+                self.wfile.write(self.body)
         except (BrokenPipeError, ConnectionResetError):
-            pass  # client stopped reading at the cap
+            pass  # client stopped reading at the cap or the deadline
 
     def log_message(self, *args):
         pass
@@ -54,11 +71,14 @@ class RclonePendingTest(unittest.TestCase):
     def setUp(self):
         FakeRc.requests = []
         FakeRc.chunked = False
+        FakeRc.trickle_body = FakeRc.trickle_headers = 0
+        FakeRc.stop = threading.Event()
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeRc)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
 
     def tearDown(self):
+        FakeRc.stop.set()  # release trickling handlers so server_close can join them
         self.server.shutdown()
         self.server.server_close()
 
@@ -100,6 +120,38 @@ class RclonePendingTest(unittest.TestCase):
         self.tearDown()
         self.assertEqual(dl.rclone_pending(self.url, "gdrive:"), -1)
         self.setUp()
+
+    def assert_gives_up_on_time(self):
+        t = time.monotonic()
+        self.assertEqual(dl.rclone_pending(self.url, "gdrive:", timeout=0.5), -1)
+        self.assertLess(time.monotonic() - t, 0.9)
+
+    def test_trickled_body_hits_overall_deadline(self):
+        FakeRc.trickle_body = 0.2
+        self.serve({"diskCache": {"uploadsQueued": 1}})
+        self.assert_gives_up_on_time()
+
+    def test_trickled_headers_hit_overall_deadline(self):
+        FakeRc.trickle_headers = 0.2
+        self.serve({"diskCache": {"uploadsQueued": 1}})
+        self.assert_gives_up_on_time()
+
+    def test_fast_reply_within_deadline(self):
+        self.serve({"diskCache": {"uploadsQueued": 4}})
+        self.assertEqual(dl.rclone_pending(self.url, "gdrive:", timeout=0.5), 4)
+
+    def test_stuck_request_does_not_block_exit(self):
+        FakeRc.trickle_body = 0.2
+        self.serve({"pad": "x" * 1000})
+        script = ("import sys; sys.dont_write_bytecode = True\n"
+                  "import importlib.machinery as m, importlib.util as u\n"
+                  "l = m.SourceFileLoader('dl', %r); d = u.module_from_spec(u.spec_from_loader('dl', l))\n"
+                  "l.exec_module(d); print(d.rclone_pending(%r, 'gdrive:', timeout=0.3))\n"
+                  % (os.path.join(ROOT, "bin", "drives-list"), self.url))
+        t = time.monotonic()
+        out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=10)
+        self.assertLess(time.monotonic() - t, 3)
+        self.assertEqual(out.stdout.strip(), "-1")
 
     def test_sends_full_fs_for_subpath_mounts(self):
         self.serve({"diskCache": {"uploadsQueued": 1}})

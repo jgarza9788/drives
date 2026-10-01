@@ -72,15 +72,29 @@ BarWidget {
 
   // ---- data ---------------------------------------------------------------
 
+  // One drives-list run at a time. A run past `listerTimeoutMs` is abandoned
+  // (asked to stop, its output ignored) so a hang can't freeze the widget;
+  // the poll timer's next refresh() is what notices.
+  property var lister: null
+  property real listerStarted: 0
+  readonly property int listerTimeoutMs: 20000
+  property bool refreshAgain: false
+
   function refresh() {
-    if (lister.running) { refreshAgain = true; return }
+    if (lister) {
+      if (Date.now() - listerStarted < listerTimeoutMs) { refreshAgain = true; return }
+      console.warn("jgarza.drives: drives-list still running after", listerTimeoutMs / 1000, "s; abandoning it")
+      lister.abandoned = true
+      lister.running = false
+      lister = null
+    }
     var cmd = [script("drives-list"), "--thumb-max-gb", String(thumbMaxGb)]
     if (showNetwork) cmd.push("--network")
     if (showUnmounted) cmd.push("--unmounted", "--min-unmounted-mb", String(minUnmountedMb))
-    lister.command = cmd
+    lister = listerProcess.createObject(root, { command: cmd })
+    listerStarted = Date.now()
     lister.running = true
   }
-  property bool refreshAgain: false
 
   // Keep delegates alive across refreshes (an open card must not be torn
   // down because the used-bytes figure moved): update the ListModel in place,
@@ -117,18 +131,29 @@ BarWidget {
 
   ListModel { id: driveModel }
 
-  Process {
-    id: lister
-    stdout: StdioCollector {
-      onStreamFinished: {
-        try {
-          root.syncModel(JSON.parse(text).drives || [])
-        } catch (e) {
-          console.warn("jgarza.drives: bad lister output", e)
+  Component {
+    id: listerProcess
+    Process {
+      id: listerRun
+      property bool abandoned: false
+      stdout: StdioCollector {
+        onStreamFinished: {
+          if (listerRun.abandoned) return  // a newer run owns the list
+          try {
+            root.syncModel(JSON.parse(text).drives || [])
+          } catch (e) {
+            console.warn("jgarza.drives: bad lister output", e)
+          }
         }
       }
+      onExited: {
+        if (root.lister === listerRun) {
+          root.lister = null
+          if (root.refreshAgain) { root.refreshAgain = false; root.refresh() }
+        }
+        destroy()
+      }
     }
-    onExited: if (root.refreshAgain) { root.refreshAgain = false; root.refresh() }
   }
 
   // Write activity, streamed. Only needed while a block drive is listed.

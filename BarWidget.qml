@@ -353,7 +353,7 @@ BarWidget {
         id: icon
         anchors.fill: parent
         bar: root.bar
-        fontSize: Style.font.iconLarge
+        fontSize: Style.bar.iconFont
         horizontalMargin: 5
         onPressed: function(button) { card.open = false; slot.clicked(button) }
       }
@@ -381,7 +381,7 @@ BarWidget {
       bar: root.bar
       visible: root.drives.length === 0 && root.alwaysShow
       text: root.icons.internal || Model.DEFAULT_ICONS.internal
-      fontSize: Style.font.iconLarge
+      fontSize: Style.bar.iconFont
       dimmed: true
       pressable: false
       tooltipText: "No drives"

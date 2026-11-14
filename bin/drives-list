@@ -22,9 +22,13 @@ filesystem on a disk other than the one hosting / — mounted, or (with
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import select
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -69,11 +73,68 @@ USB_SPEEDS = {"1.5": "USB 1.0", "12": "USB 1.1", "480": "USB 2.0", "5000": "USB 
               "10000": "USB 3.1 (10 Gb/s)", "20000": "USB 3.2 (20 Gb/s)", "40000": "USB4 (40 Gb/s)"}
 
 
-def run(cmd):
+# The whole run is bounded: SIGALRM/SIGTERM kill every child we spawned (they
+# each lead their own process group) and exit, so an abandoned or hung run
+# leaves nothing behind. The widget gives up on a run after 20s.
+WATCHDOG_SECONDS = 15
+MAX_CMD_OUTPUT = 4 * 1024 * 1024   # bytes of any one helper's stdout
+_children = set()
+
+
+def kill_children():
+    for p in list(_children):
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    _children.clear()
+
+
+def _die(*_):
+    kill_children()
+    os._exit(1)
+
+
+def spawn(cmd, **kw):
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, start_new_session=True, **kw)
+    _children.add(p)
+    return p
+
+
+def reap(p):
+    _children.discard(p)
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def run(cmd, timeout=5):
+    """stdout of cmd (capped at MAX_CMD_OUTPUT), or "" on failure or timeout.
+    The child runs in its own group, which dies with it."""
+    try:
+        p = spawn(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
         return ""
+    try:
+        out = b""
+        deadline = time.monotonic() + timeout
+        fd = p.stdout.fileno()
+        while len(out) <= MAX_CMD_OUTPUT:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                return ""
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            out += data
+        else:
+            return ""  # runaway output
+        return out.decode("utf-8", "replace").strip()
+    finally:
+        p.stdout.close()
+        reap(p)
+        p.wait()
 
 
 def root_disk_name():
@@ -100,17 +161,66 @@ def usage(mountpoint):
     return size, used, bool(st.f_flag & os.ST_RDONLY)
 
 
+def start_time(pid):
+    """Boot-relative start time of pid (stat field 22), or None if gone."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def probe_marker(mountpoint):
+    """Path of the file recording the last statvfs probe of mountpoint."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(base, "jgarza.drives-%d" % os.getuid(),
+                        hashlib.sha1(mountpoint.encode()).hexdigest())
+
+
+def probe_stuck(mountpoint):
+    """True if an earlier probe of this mount is still alive (hard NFS in D
+    state can't be killed). Spawning another would only pile up more."""
+    try:
+        with open(probe_marker(mountpoint)) as f:
+            pid, started = map(int, f.read().split())
+    except (OSError, ValueError):
+        return False
+    return start_time(pid) == started
+
+
+def mark_probe(mountpoint, pid):
+    started = start_time(pid)
+    if started is None:
+        return
+    path = probe_marker(mountpoint)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as f:
+            f.write("%d %d" % (pid, started))
+    except OSError:
+        pass
+
+
+def clear_probe(mountpoint):
+    try:
+        os.unlink(probe_marker(mountpoint))
+    except OSError:
+        pass
+
+
 def bounded_usage(mountpoints, timeout=NET_USAGE_TIMEOUT):
     """mountpoint -> (size, used, readOnly), all queried in parallel; zeros
     for any that can't be read or don't answer within timeout."""
     procs = {}
     for m in mountpoints:
+        if probe_stuck(m):
+            continue  # last run's probe still hangs on this mount: unknown
         try:
-            procs[m] = subprocess.Popen([sys.executable, "-c", STATVFS_CHILD, m],
-                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True)
+            procs[m] = spawn([sys.executable, "-c", STATVFS_CHILD, m],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError:
-            pass
+            continue
+        mark_probe(m, procs[m].pid)
     deadline = time.monotonic() + timeout
     out = {}
     for m in mountpoints:
@@ -121,18 +231,21 @@ def bounded_usage(mountpoints, timeout=NET_USAGE_TIMEOUT):
         try:
             size, used, ro = p.communicate(timeout=max(0, deadline - time.monotonic()))[0].split()
             out[m] = (int(size), int(used), ro == "1")
+            clear_probe(m)
         except subprocess.TimeoutExpired:
             # Reap it if SIGKILL works (FUSE waits are killable), but don't
             # wait on hard NFS, which only lets go once the server answers.
             # It holds none of our fds, so we can exit either way.
-            p.kill()
+            reap(p)
             p.stdout.close()
             try:
                 p.wait(timeout=0.05)
             except subprocess.TimeoutExpired:
                 pass
         except ValueError:
-            pass  # statvfs failed in the child
+            clear_probe(m)  # statvfs failed in the child (it exited)
+        else:
+            _children.discard(p)
     return out
 
 
@@ -303,6 +416,8 @@ def network_drives():
 def rclone_mounts():
     """[(args after `mount`, rc URL)] for this user's `rclone mount --rc` processes."""
     found = []
+    if not shutil.which("pgrep"):
+        return found
     for pid in run(["pgrep", "-u", str(os.getuid()), "-x", "rclone"]).split():
         try:
             with open("/proc/%s/cmdline" % pid, "rb") as f:
@@ -381,7 +496,8 @@ def rclone_drives():
         return []
     # "gdrive:      drive" -> {"gdrive": "drive"}
     types = {}
-    for line in run(["rclone", "listremotes", "--long"]).splitlines():
+    listing = run(["rclone", "listremotes", "--long"]) if shutil.which("rclone") else ""
+    for line in listing.splitlines():
         parts = line.split()
         if len(parts) >= 2:
             types[parts[0].rstrip(":")] = parts[1]
@@ -429,7 +545,18 @@ def gvfs_drives():
     return drives
 
 
+REQUIRED_TOOLS = ("lsblk", "findmnt")
+
+
 def main():
+    missing = [t for t in REQUIRED_TOOLS if not shutil.which(t)]
+    if missing:
+        print(json.dumps({"drives": [], "error": "missing required tool: " + ", ".join(missing)}))
+        return
+    signal.signal(signal.SIGTERM, _die)
+    signal.signal(signal.SIGINT, _die)
+    signal.signal(signal.SIGALRM, _die)
+    signal.alarm(WATCHDOG_SECONDS)
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", action="store_true",
                         help="include network shares and cloud drives")
@@ -456,6 +583,7 @@ def main():
         except Exception as exc:
             errors.append(str(exc) or type(exc).__name__)
     print(json.dumps({"drives": drives, "error": "; ".join(errors)}))
+    kill_children()
 
 
 if __name__ == "__main__":

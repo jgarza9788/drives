@@ -87,8 +87,11 @@ BarWidget {
       lister.abandoned = true
       lister.running = false
       lister = null
+      refreshAgain = false
     }
-    var cmd = [script("drives-list"), "--thumb-max-gb", String(thumbMaxGb)]
+    // `timeout` leads its own process group and SIGKILLs it, so a stopped or
+    // overrunning run can't leave helper children behind.
+    var cmd = ["timeout", "-k", "2", "18", script("drives-list"), "--thumb-max-gb", String(thumbMaxGb)]
     if (showNetwork) cmd.push("--network")
     if (showUnmounted) cmd.push("--unmounted", "--min-unmounted-mb", String(minUnmountedMb))
     lister = listerProcess.createObject(root, { command: cmd })
@@ -182,6 +185,10 @@ BarWidget {
     stdout: SplitParser {
       onRead: function() { debounce.restart(); settle.restart() }
     }
+    // Missing udevadm: hotplug refresh is lost, the poll timer still works.
+    onExited: function(code) {
+      if (code !== 0) console.warn("jgarza.drives: udevadm monitor exited with", code, "- relying on polling")
+    }
   }
   Timer { id: debounce; interval: 500; onTriggered: root.refresh() }
   Timer { id: settle; interval: 2500; onTriggered: root.refresh() }
@@ -259,17 +266,34 @@ BarWidget {
   }
 
   // Short-lived process; `done(result)` gets the JSON line drives-action prints.
+  // Helper runs (drives-action) are wrapped in `timeout` so stopping one also
+  // takes its descendants down; xdg-open and terminal launches are not (the
+  // terminal must outlive the launcher).
+  property var actions: []
+
   function run(cmd, done) {
+    var bounded = String(cmd[0]).indexOf("bin/drives-action") >= 0
+    if (bounded) cmd = ["timeout", "-k", "5", "130"].concat(cmd)
     var p = actionProcess.createObject(root, { command: cmd, done: done || null })
+    root.actions = root.actions.concat([p])
     p.running = true
   }
 
   Component {
     id: actionProcess
     Process {
+      id: actionRun
       property var done: null
       stdout: StdioCollector { id: out }
+      // Backstop: drives-action bounds itself (120s) and `timeout` kills the
+      // group at 130s; this stops the Process itself if even that stalls.
+      Timer {
+        interval: 150000
+        running: actionRun.running
+        onTriggered: { console.warn("jgarza.drives: action still running; stopping it"); actionRun.running = false }
+      }
       onExited: {
+        root.actions = root.actions.filter(function(p) { return p !== actionRun })
         if (done) {
           var result = { status: "error", message: "" }
           try { result = JSON.parse(out.text.trim().split("\n").pop()) } catch (e) {}
@@ -296,6 +320,8 @@ BarWidget {
 
   Component.onCompleted: refresh()
   Component.onDestruction: {
+    if (lister) { lister.abandoned = true; lister.running = false }
+    root.actions.forEach(function(p) { p.running = false })
     if (monitor.running) monitor.running = false
     if (activityWatch.running) activityWatch.running = false
   }

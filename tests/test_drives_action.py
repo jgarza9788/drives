@@ -5,11 +5,13 @@ Run: python3 -m unittest discover tests
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -178,6 +180,37 @@ class TerminateTest(unittest.TestCase):
             self.assertEqual(found[0]["start"], da.start_time(p.pid))
         finally:
             os.rmdir(d)
+
+
+
+class RunBoundsTest(unittest.TestCase):
+    def test_timeout_kills_group_and_reports(self):
+        t = time.monotonic()
+        code, out = da.run(["sh", "-c", "sleep 30 & sleep 30"], timeout=1)
+        self.assertEqual(code, 124)
+        self.assertIn("timed out", out)
+        self.assertLess(time.monotonic() - t, 5)
+
+    def test_output_is_capped(self):
+        code, out = da.run(["sh", "-c", "yes x | head -c 1000000"], timeout=10)
+        self.assertEqual(code, 125)
+        self.assertLessEqual(len(out), da.MAX_OUTPUT + 64)
+
+    def test_normal_output(self):
+        self.assertEqual(da.run(["sh", "-c", "echo hi; echo err >&2"]), (0, "hi\nerr"))
+
+    def test_missing_binary(self):
+        self.assertEqual(da.run(["definitely-not-a-binary"])[0], 127)
+
+class KillWithoutPidfdTest(unittest.TestCase):
+    def test_refuses_cleanly(self):
+        a = mock.Mock(mount="/mnt/x", kill=True, name="x")
+        out = io.StringIO()
+        with mock.patch.object(da, "busy_procs", return_value=[{"pid": 1, "name": "x", "start": 1}]), \
+                mock.patch.object(da, "os", types.SimpleNamespace()), \
+                mock.patch("sys.stdout", out), self.assertRaises(SystemExit):
+            da.cmd_eject(a)
+        self.assertEqual(json.loads(out.getvalue())["status"], "error")
 
 
 if __name__ == "__main__":

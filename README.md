@@ -84,19 +84,38 @@ writes no config files, so there's nothing else to clean up.
 
 ## Dependencies
 
-All of these come with a standard Omarchy / Arch install:
+Required (all come with a standard Omarchy / Arch install):
 
-- `python3`: runs the helper scripts in `bin/`
-- `util-linux` (`lsblk`, `findmnt`) and `systemd` (`udevadm`): find the drives
+- Linux 5.3+ and `python3` 3.9+: runs the helpers in `bin/`; `pidfd` signalling
+  is what lets `--kill` avoid hitting a reused PID
+- `coreutils` (`timeout`): the widget runs `drives-list` and `drives-action`
+  under it so a stopped run takes its children with it
+- `util-linux` (`lsblk`, `findmnt`): find the drives. Without them `drives-list`
+  reports `missing required tool` and the widget shows nothing
+- `systemd` (`udevadm`): plug / unplug events. Without it the widget falls back
+  to polling (a warning is logged)
 - `udisks2` (`udisksctl`): mount, unmount, unlock, lock and power off, all
   without sudo
-- `libnotify` (`notify-send`) and `xdg-utils` (`xdg-open`)
+- `libnotify` (`notify-send`) and `xdg-utils` (`xdg-open`): outcome
+  notifications and opening a drive. A missing `notify-send` only loses the
+  notification.
+
+If a tool an action needs is missing, the action fails with a message naming
+it; the bar widget itself keeps running.
+
+All helpers are bounded: the widget kills a `drives-list` run after 18 s (the
+script's own watchdog fires at 15 s) and a `drives-action` run after 130 s
+(120 s inside the script); `drives-action` also caps each command at 30 s and
+4 KB of output. A timed-out child's whole process group is killed. Network
+mounts that stop answering are probed in a child process; while an earlier
+probe of the same mount is still stuck (hard NFS can't be killed), no new one
+is started and its usage shows as unknown.
 
 Optional:
 
 - `fuse3` (`fusermount3`): unmounts rclone and sshfs mounts
 - `glib2` (`gio`): unmounts GNOME Online Accounts and gvfs network mounts
-- `rclone`: for cloud drives. Start the mount with `--rc` to see upload status.
+- `procps-ng` (`pgrep`) and `rclone`: for cloud drives. Start the mount with `--rc` to see upload status.
 
 Sync clients like `onedrive` (abraunegg), Dropbox and Insync keep a normal
 folder in your home instead of mounting anything, so they don't show up. To

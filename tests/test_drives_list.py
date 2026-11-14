@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -282,6 +283,47 @@ class RcloneMountsTest(unittest.TestCase):
         self.assertEqual(dl.rc_url_for(found, "my drive:"), "http://localhost:5572")
 
 
+class StuckProbeTest(unittest.TestCase):
+    """A probe stuck in D state (hard NFS) must not be joined by a new one per poll."""
+
+    def setUp(self):
+        self.rt = tempfile.mkdtemp()
+        env = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.rt})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(shutil.rmtree, self.rt, True)
+
+    def test_live_probe_is_not_respawned(self):
+        dl.mark_probe("/mnt/hung", os.getpid())  # stand-in for the stuck child
+        with mock.patch.object(dl, "spawn") as spawn:
+            out = dl.bounded_usage(["/mnt/hung"], timeout=0.2)
+        spawn.assert_not_called()
+        self.assertEqual(out, {"/mnt/hung": (0, 0, False)})
+
+    def test_dead_probe_is_respawned(self):
+        path = dl.probe_marker("/")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write("%d %d" % (os.getpid(), dl.start_time(os.getpid()) + 1))  # pid reused
+        self.assertFalse(dl.probe_stuck("/"))
+        self.assertGreater(dl.bounded_usage(["/"])["/"][0], 0)
+
+    def test_marker_cleared_after_answer(self):
+        dl.bounded_usage(["/"])
+        self.assertFalse(os.path.exists(dl.probe_marker("/")))
+
+
+class RequiredToolsTest(unittest.TestCase):
+    def test_missing_lsblk_reports_error_json(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["drives-list"]), mock.patch("sys.stdout", out), \
+                mock.patch.object(dl.shutil, "which", return_value=None):
+            dl.main()
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["drives"], [])
+        self.assertIn("lsblk", data["error"])
+
+
 class MainTest(unittest.TestCase):
     def run_main(self, *argv):
         out = io.StringIO()
@@ -314,6 +356,35 @@ class MainTest(unittest.TestCase):
         with mock.patch.object(dl, "block_drives", return_value=[]):
             self.assertEqual(self.run_main()["error"], "")
 
+
+
+class RunBoundsTest(unittest.TestCase):
+    def test_run_times_out_and_kills_group(self):
+        t = time.monotonic()
+        self.assertEqual(dl.run(["sh", "-c", "sleep 30 & sleep 30"], timeout=1), "")
+        self.assertLess(time.monotonic() - t, 5)
+
+    def test_run_refuses_runaway_output(self):
+        self.assertEqual(dl.run(["sh", "-c", "yes x | head -c 9000000"], timeout=10), "")
+
+    def test_run_returns_output(self):
+        self.assertEqual(dl.run(["echo", "hi"]), "hi")
+
+    def test_sigterm_kills_children(self):
+        code = ("import importlib.machinery as m, importlib.util as u, sys, time\n"
+                "l = m.SourceFileLoader('dl', %r); d = u.module_from_spec(u.spec_from_loader('dl', l))\n"
+                "l.exec_module(d)\n"
+                "import signal; signal.signal(signal.SIGTERM, d._die)\n"
+                "p = d.spawn(['sleep', '31337'])\n"
+                "print(p.pid, flush=True); time.sleep(30)\n" % os.path.join(ROOT, "bin", "drives-list"))
+        p = subprocess.Popen([sys.executable, "-B", "-c", code], stdout=subprocess.PIPE, text=True)
+        child = int(p.stdout.readline())
+        p.terminate()
+        p.wait(timeout=5)
+        time.sleep(0.3)
+        self.assertFalse(os.path.exists("/proc/%d" % child) and
+                         "sleep" in open("/proc/%d/comm" % child).read()
+                         and open("/proc/%d/stat" % child).read().rsplit(")", 1)[1].split()[0] != "Z")
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,22 +25,96 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
 import time
 
+# Helper bounds: every child gets a total deadline and an output cap, and runs
+# in its own session so a timeout takes its whole process group down.
+RUN_TIMEOUT = 30.0      # mount / unmount / lock / power-off
+NOTIFY_TIMEOUT = 5.0
+UNLOCK_TIMEOUT = 300.0  # interactive: the user types a passphrase
+MAX_OUTPUT = 4096       # bytes kept of a child's output; it is killed past 4x this
+MAX_PROCS_SCANNED = 4096
+MAX_PATHS_PER_PROC = 4096
 
-def run(cmd):
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    return p.returncode, (p.stdout + p.stderr).strip()
+
+def kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run(cmd, timeout=RUN_TIMEOUT):
+    """(returncode, stdout+stderr text) with a total deadline and an output
+    cap. A child that overruns either is killed along with its descendants
+    (code 124 on timeout, 125 on runaway output)."""
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as exc:
+        return 127, str(exc)
+    deadline = time.monotonic() + timeout
+    chunks, size, code = [], 0, None
+    fd = p.stdout.fileno()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                kill_group(p)
+                code = 124
+                break
+            if not select.select([fd], [], [], min(left, 0.5))[0]:
+                continue
+            data = os.read(fd, 4096)
+            if not data:
+                break
+            size += len(data)
+            if size <= MAX_OUTPUT:
+                chunks.append(data)
+            elif size > MAX_OUTPUT * 4:
+                kill_group(p)
+                code = 125
+                break
+        if code is None:
+            try:
+                code = p.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                kill_group(p)
+                code = 124
+    finally:
+        p.stdout.close()
+        try:
+            os.killpg(p.pid, signal.SIGKILL)  # stragglers holding no pipe
+        except OSError:
+            pass
+    text = b"".join(chunks).decode("utf-8", "replace").strip()
+    if code == 124:
+        text = (text + "\n" if text else "") + "timed out after %ds" % timeout
+    elif code == 125:
+        text = (text + "\n" if text else "") + "output limit exceeded"
+    return code, text
 
 
 def notify(title, body="", urgent=False):
-    cmd = ["notify-send", "-a", "Drives", title, body]
+    cmd = ["notify-send", "-a", "Drives", title[:200], body[:MAX_OUTPUT]]
     if urgent:
         cmd[1:1] = ["-u", "critical"]
-    subprocess.run(cmd, capture_output=True)
+    run(cmd, NOTIFY_TIMEOUT)
+
+
+def require(*tools):
+    """Fail with a clear message when a needed native tool is missing."""
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        done("error", "missing required tool: " + ", ".join(missing))
 
 
 def done(status, message="", **extra):
@@ -83,7 +157,7 @@ def busy_procs(mount):
     """[{pid, name, start}] for processes of ours with anything open under mount."""
     me = os.getpid()
     procs = []
-    for pid in filter(str.isdigit, os.listdir("/proc")):
+    for pid in list(filter(str.isdigit, os.listdir("/proc")))[:MAX_PROCS_SCANNED]:
         if int(pid) == me:
             continue
         base = "/proc/" + pid
@@ -94,7 +168,7 @@ def busy_procs(mount):
             except OSError:
                 pass
         try:
-            for fd in os.listdir(base + "/fd"):
+            for fd in os.listdir(base + "/fd")[:MAX_PATHS_PER_PROC]:
                 try:
                     paths.append(os.readlink(base + "/fd/" + fd))
                 except OSError:
@@ -103,7 +177,12 @@ def busy_procs(mount):
             continue  # not ours
         try:
             with open(base + "/maps") as f:
-                paths += [line.split(None, 5)[5].strip() for line in f if len(line.split(None, 5)) == 6]
+                for n, line in enumerate(f):
+                    if n >= MAX_PATHS_PER_PROC:
+                        break
+                    parts = line.split(None, 5)
+                    if len(parts) == 6:
+                        paths.append(parts[5].strip())
         except OSError:
             pass
         # A root of "/" would match every mount; only a chroot into it counts.
@@ -177,6 +256,8 @@ def cmd_busy(a):
 def cmd_eject(a):
     procs = busy_procs(a.mount) if a.mount else []
     if procs and a.kill:
+        if not hasattr(os, "pidfd_open"):
+            done("error", "--kill needs Python 3.9+ on Linux 5.3+ (pidfd)", procs=procs)
         terminate(procs)
         time.sleep(0.2)
         procs = busy_procs(a.mount)
@@ -184,6 +265,8 @@ def cmd_eject(a):
         notify("%s is busy" % a.name, "In use by " + proc_list(procs), urgent=True)
         done("busy", "in use by " + proc_list(procs), procs=procs)
 
+    require({"udisks": "udisksctl", "loop": "udisksctl", "fuse": "fusermount3",
+             "gio": "gio"}.get(a.mode, "udisksctl"))
     if a.mode == "udisks":
         steps = [["udisksctl", "unmount", "-b", a.dev]]
         if a.luks:
@@ -201,7 +284,7 @@ def cmd_eject(a):
 
     for i, step in enumerate(steps):
         code, out = run(step)
-        if step[0] == "fusermount3" and code != 0:
+        if step[0] == "fusermount3" and code != 0 and shutil.which("fusermount"):
             code, out = run(["fusermount", "-u", a.mount])
         # Power-off is a courtesy: a failure there still left it unmounted.
         if code != 0 and not (i > 0 and step[1] == "power-off"):
@@ -223,6 +306,7 @@ def mounted_at(out):
 
 
 def cmd_mount(a):
+    require("udisksctl")
     code, out = run(["udisksctl", "mount", "-b", a.dev])
     if code != 0:
         notify("Could not mount %s" % a.name, out, urgent=True)
@@ -231,10 +315,19 @@ def cmd_mount(a):
 
 
 def cmd_unlock(a):
-    # Interactive: udisksctl asks for the passphrase on this terminal.
+    # Interactive: udisksctl asks for the passphrase on this terminal, so it
+    # keeps the terminal (no new session) but still gets a total deadline.
+    if not shutil.which("udisksctl"):
+        sys.stderr.write("missing required tool: udisksctl\n")
+        sys.exit(1)
     print("Unlocking %s (%s)\n" % (a.name, a.dev), flush=True)
-    p = subprocess.run(["udisksctl", "unlock", "-b", a.dev], stdout=subprocess.PIPE, text=True)
-    sys.stdout.write(p.stdout)
+    try:
+        p = subprocess.run(["udisksctl", "unlock", "-b", a.dev], stdout=subprocess.PIPE,
+                           text=True, timeout=UNLOCK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        notify("Unlock of %s timed out" % a.name, urgent=True)
+        sys.exit(1)
+    sys.stdout.write(p.stdout[:MAX_OUTPUT])
     if p.returncode != 0:
         notify("Could not unlock %s" % a.name, urgent=True)
         sys.exit(1)
@@ -252,6 +345,7 @@ def cmd_unlock(a):
 
 
 def cmd_lock(a):
+    require("udisksctl")
     if a.mount:
         procs = busy_procs(a.mount)
         if procs:
@@ -281,6 +375,10 @@ def main():
     ap.add_argument("--removable", action="store_true")
     ap.add_argument("--kill", action="store_true")
     a = ap.parse_args()
+    # A wedged unmount must not outlive the bar's patience: bound the whole run.
+    if a.action not in ("unlock", "busy"):
+        signal.signal(signal.SIGALRM, lambda *_: done("error", "timed out"))
+        signal.alarm(120)
     {"eject": cmd_eject, "mount": cmd_mount, "unlock": cmd_unlock,
      "lock": cmd_lock, "busy": cmd_busy}[a.action](a)
 

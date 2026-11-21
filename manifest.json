@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jgarza.drives",
   "name": "Drives",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "jgarza",
   "description": "One bar icon per drive — thumb drives, external and internal disks, SD cards, discs, images, network shares and cloud drives. Hover for usage, activity and specs; mount, open, eject.",
   "license": "MIT",

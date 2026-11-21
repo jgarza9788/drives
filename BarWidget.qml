@@ -281,18 +281,20 @@ BarWidget {
 
   Component {
     id: actionProcess
-    Process {
+    // An Item wraps the Process: Process has no default property, so the
+    // timers cannot be its children.
+    Item {
       id: actionRun
       property var done: null
-      stdout: StdioCollector { id: out }
-      // Backstop: drives-action bounds itself (120s) and `timeout` kills the
-      // group at 130s; this stops the Process itself if even that stalls.
-      Timer {
-        interval: 150000
-        running: actionRun.running
-        onTriggered: { console.warn("jgarza.drives: action still running; stopping it"); actionRun.running = false }
-      }
-      onExited: {
+      property alias command: proc.command
+      property alias running: proc.running
+      // Settles exactly once. onExited covers a normal run; a command that
+      // never starts (missing binary, FailedToStart) emits no exited signal,
+      // so the watchdog below settles it once it has seen it stopped twice.
+      property bool settled: false
+      function settle() {
+        if (settled) return
+        settled = true
         root.actions = root.actions.filter(function(p) { return p !== actionRun })
         if (done) {
           var result = { status: "error", message: "" }
@@ -301,6 +303,28 @@ BarWidget {
         }
         root.refresh()
         destroy()
+      }
+      Process {
+        id: proc
+        stdout: StdioCollector { id: out }
+        onExited: actionRun.settle()
+      }
+      // Backstop: drives-action bounds itself (120s) and `timeout` kills the
+      // group at 130s; this stops the Process itself if even that stalls.
+      Timer {
+        interval: 150000
+        running: proc.running
+        onTriggered: { console.warn("jgarza.drives: action still running; stopping it"); proc.running = false }
+      }
+      Timer {
+        property int stoppedTicks: 0
+        interval: 500
+        repeat: true
+        running: !actionRun.settled
+        onTriggered: {
+          stoppedTicks = proc.running ? 0 : stoppedTicks + 1
+          if (stoppedTicks >= 2) actionRun.settle()
+        }
       }
     }
   }

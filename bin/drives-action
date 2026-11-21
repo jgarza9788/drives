@@ -41,9 +41,18 @@ MAX_PROCS_SCANNED = 4096
 MAX_PATHS_PER_PROC = 4096
 
 
+# Children still running. A signal that ends this helper (the bar's `timeout`,
+# a cancelled action, the shell unloading the plugin) takes them down too,
+# including ones in their own session, which the caller's group kill misses.
+LIVE = set()
+
+
 def kill_group(proc):
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        if getattr(proc, "own_session", True):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
     except OSError:
         pass
     try:
@@ -52,15 +61,35 @@ def kill_group(proc):
         pass
 
 
-def run(cmd, timeout=RUN_TIMEOUT):
+def kill_live():
+    for p in list(LIVE):
+        kill_group(p)
+    LIVE.clear()
+
+
+def on_signal(signum, _frame):
+    kill_live()
+    sys.exit(128 + signum)
+
+
+def run(cmd, timeout=RUN_TIMEOUT, interactive=False):
     """(returncode, stdout+stderr text) with a total deadline and an output
     cap. A child that overruns either is killed along with its descendants
-    (code 124 on timeout, 125 on runaway output)."""
+    (code 124 on timeout, 125 on runaway output). Output is read in bounded
+    chunks as it arrives, so no more than MAX_OUTPUT bytes are ever kept.
+
+    interactive: the child keeps this terminal (stdin, stderr and the session)
+    so it can prompt there; only its stdout is captured."""
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, start_new_session=True)
+        if interactive:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        else:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
     except OSError as exc:
         return 127, str(exc)
+    p.own_session = not interactive
+    LIVE.add(p)
     deadline = time.monotonic() + timeout
     chunks, size, code = [], 0, None
     fd = p.stdout.fileno()
@@ -76,10 +105,10 @@ def run(cmd, timeout=RUN_TIMEOUT):
             data = os.read(fd, 4096)
             if not data:
                 break
+            if size < MAX_OUTPUT:
+                chunks.append(data[:MAX_OUTPUT - size])
             size += len(data)
-            if size <= MAX_OUTPUT:
-                chunks.append(data)
-            elif size > MAX_OUTPUT * 4:
+            if size > MAX_OUTPUT * 4:
                 kill_group(p)
                 code = 125
                 break
@@ -91,10 +120,14 @@ def run(cmd, timeout=RUN_TIMEOUT):
                 code = 124
     finally:
         p.stdout.close()
-        try:
-            os.killpg(p.pid, signal.SIGKILL)  # stragglers holding no pipe
-        except OSError:
-            pass
+        if p.own_session:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)  # stragglers holding no pipe
+            except OSError:
+                pass
+        elif p.poll() is None:
+            kill_group(p)
+        LIVE.discard(p)
     text = b"".join(chunks).decode("utf-8", "replace").strip()
     if code == 124:
         text = (text + "\n" if text else "") + "timed out after %ds" % timeout
@@ -321,18 +354,16 @@ def cmd_unlock(a):
         sys.stderr.write("missing required tool: udisksctl\n")
         sys.exit(1)
     print("Unlocking %s (%s)\n" % (a.name, a.dev), flush=True)
-    try:
-        p = subprocess.run(["udisksctl", "unlock", "-b", a.dev], stdout=subprocess.PIPE,
-                           text=True, timeout=UNLOCK_TIMEOUT)
-    except subprocess.TimeoutExpired:
+    code, text = run(["udisksctl", "unlock", "-b", a.dev], timeout=UNLOCK_TIMEOUT, interactive=True)
+    if code == 124:
         notify("Unlock of %s timed out" % a.name, urgent=True)
         sys.exit(1)
-    sys.stdout.write(p.stdout[:MAX_OUTPUT])
-    if p.returncode != 0:
+    sys.stdout.write(text + "\n" if text else "")
+    if code != 0:
         notify("Could not unlock %s" % a.name, urgent=True)
         sys.exit(1)
     # "Unlocked /dev/sdb1 as /dev/dm-3."
-    m = re.search(r" as (/dev/\S+?)\.?$", p.stdout.strip())
+    m = re.search(r" as (/dev/\S+?)\.?$", text)
     if not m:
         sys.exit(0)
     code, out = run(["udisksctl", "mount", "-b", m.group(1)])
@@ -375,6 +406,8 @@ def main():
     ap.add_argument("--removable", action="store_true")
     ap.add_argument("--kill", action="store_true")
     a = ap.parse_args()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, on_signal)
     # A wedged unmount must not outlive the bar's patience: bound the whole run.
     if a.action not in ("unlock", "busy"):
         signal.signal(signal.SIGALRM, lambda *_: done("error", "timed out"))

@@ -202,6 +202,64 @@ class RunBoundsTest(unittest.TestCase):
     def test_missing_binary(self):
         self.assertEqual(da.run(["definitely-not-a-binary"])[0], 127)
 
+    def test_interactive_keeps_bound_and_cap(self):
+        code, out = da.run(["sh", "-c", "yes x | head -c 1000000"], timeout=10, interactive=True)
+        self.assertEqual(code, 125)
+        self.assertLessEqual(len(out), da.MAX_OUTPUT + 64)
+        code, out = da.run(["sh", "-c", "sleep 30"], timeout=1, interactive=True)
+        self.assertEqual(code, 124)
+
+    def test_kept_output_never_exceeds_cap(self):
+        # 3x the cap: under the kill threshold, so it runs to the end, but only
+        # MAX_OUTPUT bytes are kept.
+        code, out = da.run(["sh", "-c", "head -c %d /dev/zero | tr '\\0' x" % (da.MAX_OUTPUT * 3)])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(out), da.MAX_OUTPUT)
+
+    def test_unlock_output_is_bounded(self):
+        a = mock.Mock(dev="/dev/fake", name="fake")
+        out = io.StringIO()
+        with mock.patch.object(da.shutil, "which", return_value="/usr/bin/udisksctl"), \
+                mock.patch.object(da, "run", return_value=(125, "x" * da.MAX_OUTPUT + "\noutput limit exceeded")) as run, \
+                mock.patch.object(da, "notify"), mock.patch("sys.stdout", out), self.assertRaises(SystemExit):
+            da.cmd_unlock(a)
+        self.assertTrue(run.call_args.kwargs.get("interactive"))
+        self.assertLessEqual(len(out.getvalue()), da.MAX_OUTPUT + 200)
+
+
+class SignalCleanupTest(unittest.TestCase):
+    def test_sigterm_kills_session_children(self):
+        # The helper's child runs in its own session; SIGTERM to the helper
+        # must still take it (and its descendants) down.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pids = os.path.join(d, "pids")
+            script = (
+                "import importlib.machinery, importlib.util, signal\n"
+                "l = importlib.machinery.SourceFileLoader('da', %r)\n"
+                "s = importlib.util.spec_from_loader('da', l); m = importlib.util.module_from_spec(s); l.exec_module(m)\n"
+                "signal.signal(signal.SIGTERM, m.on_signal)\n"
+                "m.run(['sh', '-c', 'sleep 61 & echo $$ $! > %s; wait'], timeout=60)\n"
+            ) % (os.path.join(ROOT, "bin", "drives-action"), pids)
+            helper = subprocess.Popen([sys.executable, "-c", script])
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not (os.path.exists(pids) and os.path.getsize(pids)):
+                    time.sleep(0.05)
+                shell_pid, sleep_pid = (int(x) for x in open(pids).read().split())
+                helper.terminate()
+                helper.wait(timeout=5)
+                alive = lambda pid: os.path.exists("/proc/%d" % pid)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and (alive(sleep_pid) or alive(shell_pid)):
+                    time.sleep(0.05)
+                self.assertFalse(alive(sleep_pid), "session grandchild survived")
+                self.assertFalse(alive(shell_pid), "session child survived")
+            finally:
+                if helper.poll() is None:
+                    helper.kill()
+
+
 class KillWithoutPidfdTest(unittest.TestCase):
     def test_refuses_cleanly(self):
         a = mock.Mock(mount="/mnt/x", kill=True, name="x")
